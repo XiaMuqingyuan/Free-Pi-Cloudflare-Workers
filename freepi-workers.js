@@ -15,36 +15,37 @@ const AUX_TIMEOUT_MS = 15000;          // ads / session / me
 const VERSION_TIMEOUT_MS = 5000;       // /client-version
 const MAX_GATE_ROUNDS = 3;
 
-// 上游最低版本缓存
+// 上游版本缓存
 const VERSION_TTL_MS = 6 * 3600 * 1000;
 
-// 账号冷却：统一 5 分钟，不区分错误类型。
-// 冷却只是"暂时降低优先级"，不是永久封禁，5 分钟后自动恢复尝试。
+// 账号冷却：统一 5 分钟；网络/5xx 是临时故障，30 秒就够。
+// 冷却只是"暂时降低优先级"，不是永久封禁，到点自动恢复尝试。
 const COOLDOWN_MS = 5 * 60 * 1000;
-const COOLDOWN_NETWORK_MS = 30 * 1000; // 网络/5xx 是临时故障，30 秒就够
-const QUOTA_TTL_MS = 5 * 60 * 1000;          // /me 额度缓存
-// 广告闸门（实测结论，详见 README.md）：
+const COOLDOWN_NETWORK_MS = 30 * 1000;
+const COOLDOWN_429_MS = 60 * 60 * 1000; // 429 限流/hourly_ceiling：上游限流窗口通常是 1 小时级，频繁重试只会加深标记
+const QUOTA_TTL_MS = 5 * 60 * 1000; // /me 额度缓存
+
+// 广告闸门（实测结论，详见 README）：
 // 正常账号服务端根本不查广告 —— standard 车道下裸请求即 200。
-// 只有当账号被反滥用判成 restricted 后，才要求"滑动窗口内有确认曝光"，
+// 只有账号被反滥用判成 restricted 后，才要求"滑动窗口内有确认曝光"，
 // 此时才回 403 ads_required（慢车道下则伪装成 HTTP 200 的补全罐头）。
 // 所以策略是"懒曝光"：默认 0 次广告请求，被拦过才预热 + 补打点。
+const ADS_REQUIRED_TTL_MS = 20 * 60 * 1000;
 
-// 路由模式：drain = 用光一个账号再换下一个（默认）；rotate = 每个请求换一个
-const DEFAULT_ROUTING = 'drain';
 
 // per-isolate 状态
-let UPSTREAM_MIN_VERSION = null; // 从 /client-version 读到的 min（最低要求）
-let UPSTREAM_LATEST_VERSION = null; // 从 /client-version 读到的 latest（最新发版，优先跟随）
+let UPSTREAM_MIN_VERSION = null;    // /client-version 的 min（最低要求）
+let UPSTREAM_LATEST_VERSION = null; // /client-version 的 latest（最新发版，优先跟随）
 let UPSTREAM_MIN_AT = 0;
 let UPSTREAM_MIN_PENDING = null;
-let LEARNED_MIN_VERSION = null;  // 从 403 学到的值（优先级最高）
-let UPSTREAM_MIN_ERROR = null;   // 最近一次探测失败的原因（只在 healthz 里露出）
-let POOL_CURSOR = 0;
-const INFLIGHT = new Map();       // token -> 在飞 chat 数
-const COOLDOWN_UNTIL = new Map(); // token -> 冷却截止时间（临时故障）
-const EXHAUSTED_UNTIL = new Map();// token -> 额度用完的截止时间（到下个 UTC 零点）
-const QUOTA = new Map();          // token -> { at, remaining, allowance, refillAt }
-const LAST_ERROR = new Map();     // token -> 最近一次失败摘要
+let LEARNED_MIN_VERSION = null;     // 从 426/403 正文里学到的版本（优先级最高）
+let UPSTREAM_MIN_ERROR = null;      // 最近一次探测失败的原因（只在 healthz 露出）
+
+const INFLIGHT = new Map();        // token -> 在飞 chat 数
+const COOLDOWN_UNTIL = new Map();  // token -> 冷却截止时间
+const EXHAUSTED_UNTIL = new Map(); // token -> 额度用完截止时间（到下一个 UTC 零点）
+const QUOTA = new Map();           // token -> { at, remaining, allowance, refillAt }
+const LAST_ERROR = new Map();      // token -> 最近一次失败摘要
 
 export default {
   async fetch(request, env, ctx) {
@@ -57,7 +58,6 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
     const VERSION = '1.3.0';
-    const mode = String((env && env.ROUTING) || DEFAULT_ROUTING).toLowerCase() === 'rotate' ? 'rotate' : 'drain';
 
     // 账号池配置错误（JSON 写坏、全是碎片）→ 明确报 config_error，
     // 不要带着垃圾 token 去上游换回一串 401。
@@ -67,13 +67,10 @@ export default {
     try {
       accounts = poolOf(env);
     } catch (e) {
-      poolError = String(e && e.message || e);
+      poolError = String((e && e.message) || e);
     }
 
     if (url.pathname === '/healthz') {
-      // healthz 以前只读缓存：新 isolate 从没跑过 chat，就永远是 null。
-      // 这里补一次主动探测（只在没有缓存或 ?probe=1 时），5 秒超时，
-      // 读到就一起把后续请求要用的版本预热好。
       const force = url.searchParams.get('probe') === '1';
       if (force || !UPSTREAM_MIN_VERSION) {
         await upstreamMinVersion({ force });
@@ -87,9 +84,10 @@ export default {
         upstream_latest_version: UPSTREAM_LATEST_VERSION,
         version_probe: (UPSTREAM_MIN_VERSION || UPSTREAM_LATEST_VERSION) ? 'ok' : 'failed',
         ...(UPSTREAM_MIN_ERROR ? { version_error: UPSTREAM_MIN_ERROR } : {}),
-        routing: mode,
         accounts: accounts.length,
         ads_required_accounts: [...ADS_REQUIRED.keys()].filter((t) => needsAds(t)).length,
+        conversation_kv: !!convKv(env),
+        conv_nonce: !!(env && env.CONV_NONCE === '1'),
         ...(poolError ? { config_error: poolError } : {}),
       }, { headers: cors });
     }
@@ -105,7 +103,8 @@ export default {
           },
         }, { status: 500, headers: cors });
       }
-      const a = new TextEncoder().encode(key), b = new TextEncoder().encode(env.WORKER_API_KEY);
+      const a = new TextEncoder().encode(key);
+      const b = new TextEncoder().encode(env.WORKER_API_KEY);
       let diff = a.length ^ b.length;
       for (let i = 0; i < Math.min(a.length, b.length); i++) diff |= a[i] ^ b[i];
       if (diff !== 0) {
@@ -163,7 +162,6 @@ export default {
         }
       }));
       return Response.json({
-        routing: mode,
         accounts: rows,
         pool_size: rows.length,
         cooling: rows.filter((r) => r.cooling).length,
@@ -186,7 +184,7 @@ export default {
 
       let upstream;
       try {
-        upstream = await chatAcrossPool(accounts, body, env, cors, mode);
+        upstream = await chatAcrossPool(accounts, body, env, cors);
       } catch {
         return Response.json({ error: { message: 'upstream unreachable', code: 'upstream_error' } }, { status: 502, headers: cors });
       }
@@ -224,10 +222,9 @@ export default {
 
 // ── 版本解析：上游优先，变量兜底 ─────────────────────────────────────
 
-// 读 /client-version 的 min + latest；6 小时内复用，过期后台刷新。
+// 读 /client-version 的 min + latest；6 小时内复用。
 // latest 是上游最新发版号，跟随它可以让 worker 永远像"刚更新过的 CLI"，
 // 不必等 min 抬高才被动跟进。
-// 返回值可能是 null（上游不可达且从未读到过）。
 async function upstreamMinVersion({ force = false } = {}) {
   if (!force && UPSTREAM_MIN_VERSION && Date.now() - UPSTREAM_MIN_AT < VERSION_TTL_MS) {
     return UPSTREAM_MIN_VERSION;
@@ -251,7 +248,7 @@ async function upstreamMinVersion({ force = false } = {}) {
       return UPSTREAM_MIN_VERSION;
     })
     .catch((e) => {
-      UPSTREAM_MIN_ERROR = String(e && e.message || e).slice(0, 120);
+      UPSTREAM_MIN_ERROR = String((e && e.message) || e).slice(0, 120);
       return UPSTREAM_MIN_VERSION;
     })
     .finally(() => { UPSTREAM_MIN_PENDING = null; });
@@ -263,7 +260,8 @@ function cmpVersion(a, b) {
   const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
   const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] || 0, y = pb[i] || 0;
+    const x = pa[i] || 0;
+    const y = pb[i] || 0;
     if (x !== y) return x - y;
   }
   return 0;
@@ -275,9 +273,8 @@ function higherVersion(a, b) {
   return cmpVersion(a, b) >= 0 ? a : b;
 }
 
-// 生效版本：单请求 override → max(403 学到的值, 上游 latest, 上游 min) → env → 常量。
+// 生效版本：单请求 override → max(426 学到的值, 上游 latest, 上游 min) → env → 常量。
 // 取 latest 而不是 min：永远像"刚更新过的 CLI"，上游抬 min 时已经领先，不会先吃 426。
-// 仍取 max：万一 min 反超 latest（灰度回滚），用小的会一直 426。
 function clientVersion(env, override) {
   if (override) return String(override).trim();
   const upstreamBest = higherVersion(UPSTREAM_LATEST_VERSION, UPSTREAM_MIN_VERSION);
@@ -388,6 +385,12 @@ function markExhausted(token, reason) {
   LAST_ERROR.set(token, reason || 'quota exhausted');
 }
 
+// 缓存里的剩余额度（未知返回 -1，排序时排到最后）。
+function quotaRemaining(token) {
+  const q = QUOTA.get(token);
+  return q && typeof q.remaining === 'number' ? q.remaining : -1;
+}
+
 // drain 模式需要知道"这个号还剩多少"：读 /me 并缓存 5 分钟。
 // 读不到不影响可用性（当作未知，照常尝试）。
 // force=true 绕过缓存；若此时发现又有额度了，就解除 exhausted（刚重置/刚充值）。
@@ -413,8 +416,8 @@ async function ensureQuota(token, env, force = false) {
     };
     QUOTA.set(token, q);
     if (q.remaining === 0) {
-      // 0 额度 ≠ 不可用：上游会把这类账号放进慢道（spare capacity）继续服务，
-      // 实测广告流程走通后能拿到真实回复。只记录状态，不再按"用完"排除。
+      // 0 额度不等于不可用：上游会把这类账号放进慢道（spare capacity）继续服务。
+      // 只记录状态，不再按"用完"排除。
       LAST_ERROR.set(token, '0 credits left (slow lane)');
     }
     if (force) EXHAUSTED_UNTIL.delete(token);
@@ -430,30 +433,20 @@ function inflight(token, delta) {
   else INFLIGHT.set(token, n);
 }
 
-// 账号排序。
-//  drain（默认）：固定顺序，先用 0 号账号，额度用光/冷却了才往后走；
-//  rotate       ：每个请求换一个起点。
-// 两种模式都遵守：已用完(exhausted)与冷却中的排到最后；同档内"空闲账号"优先。
-function orderedPool(accounts, mode = DEFAULT_ROUTING) {
+// 账号排序：固定顺序，先用 0 号账号，额度用光/冷却了才往后走。
+// 已用完(exhausted)与冷却中的排到最后；同档内"空闲账号"优先。
+function orderedPool(accounts) {
   const load = (a) => INFLIGHT.get(a.token) || 0;
   const usable = (a) => !exhausted(a.token) && !cooling(a.token);
 
-  let ordered;
-  if (mode === 'rotate') {
-    const start = accounts.length ? POOL_CURSOR % accounts.length : 0;
-    if (accounts.length) POOL_CURSOR = (POOL_CURSOR + 1) % accounts.length;
-    ordered = accounts.map((_, i) => accounts[(start + i) % accounts.length]);
-  } else {
-    ordered = [...accounts];
-  }
-
+  const ordered = [...accounts];
   const byIdle = (a, b) => (load(a) > 0 ? 1 : 0) - (load(b) > 0 ? 1 : 0);
   const ready = ordered.filter(usable).sort(byIdle);
   const rest = ordered.filter((a) => !usable(a)).sort(byIdle);
   return [...ready, ...rest];
 }
 
-// ── 响应与请求 ────────────────────────────────────────────────────
+// ── 响应与请求 ─────────────────────────────────────────────────────
 
 function errorLike(res, probe) {
   const headers = new Headers(res.headers);
@@ -469,7 +462,7 @@ function chatFetch(token, body, env, overrideVersion, sid, onStreamEnd, turn) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), isStream ? CHAT_CONNECT_TIMEOUT_MS : CHAT_TOTAL_TIMEOUT_MS);
   const headers = { ...freepiHeaders(token, env, overrideVersion, sid), 'Content-Type': 'application/json' };
-  if (turn) headers['x-turn-id'] = turn; // CLI 的聊天请求也带当前轮 id
+  if (turn) headers['x-turn-id'] = turn;       // CLI 的聊天请求也带当前轮 id
   Object.assign(headers, adsFingerprint(env)); // 聊天也呈 Windows 桌面指纹（与 /ads/next 一致）
   return fetch(CHAT_URL, {
     method: 'POST',
@@ -504,14 +497,14 @@ function withIdleWatchdog(res, ac, onStreamEnd) {
 // ── 广告流程（复刻官方 CLI 的完整握手）────────────────────────────
 // 上游只认这个形状的请求链；缺任何一环都可能不记账。
 
-const SESSION_IDS = new Map();   // token -> 稳定 session id（isolate 生命周期内）
-const ADS_LOADED_AT = new Map(); // token -> { at, sid } 上次成功走完广告流程的时间
-// 已知会被上游广告闸门拦的账号。实测：正常账号服务端根本不查广告
-// （standard 车道裸请求即 200），只有被反滥用标记 restricted 后才要求
-// "窗口内有确认曝光"。所以默认零曝光，只有进过这张表的号才预热。
-// 带 TTL：账号恢复正常后自然过期，回到零曝光；再被拦就重新计时。
+const SESSION_IDS = new Map();   // token -> 稳定 session id
+const ADS_LOADED_AT = new Map(); // token -> { at, sid }
+// 已知会被上游广告闸门拦的账号。实测：正常账号服务端根本不查广告，
+// 只有被反滥用标记 restricted 后才要求"窗口内有确认曝光"。
+// 所以默认零曝光，只有进过这张表的号才预热；带 TTL，恢复正常后自然过期。
 const ADS_REQUIRED = new Map();  // token -> 标记过期时间戳
-const ADS_REQUIRED_TTL_MS = 20 * 60 * 1000;
+const ADS_OK_STREAK = new Map(); // token -> 连续干净成功次数
+const ADS_OK_STREAK_TO_CLEAR = 2;
 
 function markAdsRequired(token) {
   ADS_REQUIRED.set(token, Date.now() + ADS_REQUIRED_TTL_MS);
@@ -526,9 +519,6 @@ function needsAds(token) {
 
 // 快速恢复：标记期内连续 N 次请求都没再被闸门拦，说明账号已恢复正常，
 // 立即清标记回到零曝光，不必干等 TTL。
-const ADS_OK_STREAK = new Map(); // token -> 连续干净成功次数
-const ADS_OK_STREAK_TO_CLEAR = 2;
-
 function noteAdsCleanSuccess(token) {
   if (!needsAds(token)) return;
   const n = (ADS_OK_STREAK.get(token) || 0) + 1;
@@ -540,8 +530,8 @@ function noteAdsCleanSuccess(token) {
   }
 }
 
-// CLI 用 ~/.free-pi/agent/accounts.json 里每个账号自己的 sessionId；
-// worker 在 isolate 内保持稳定，重启后重新生成（上游只要求会话内一致）。
+// CLI 在每个账号上有自己的 sessionId；worker 在 isolate 内保持稳定，
+// 重启后重新生成（上游只要求会话内一致）。
 function stableSessionId(token) {
   let sid = SESSION_IDS.get(token);
   if (!sid) {
@@ -605,7 +595,7 @@ async function loadAds(token, env, sid, turn, trigger) {
   try {
     const ad = await fetchAd(token, env, sid, turn, trigger);
     if (!ad) return false;
-    if (!await fireImpression(token, env, sid, ad)) return false;
+    if (!(await fireImpression(token, env, sid, ad))) return false;
     await fireGravityBeacon(ad);
     ADS_LOADED_AT.set(token, { at: Date.now(), sid });
     return true;
@@ -629,8 +619,7 @@ const MIN_VERSION_RE = /minimum[^\d]*([\d]+\.[\d]+\.[\d]+)/i;
 
 // 账号级闸门：只有换账号才能解。
 // 注意：不能拿 "credit" 这种裸词判断——付费模型会回
-// "This model is for credit users."，那属于"模型被拒"，换账号也没用，
-// 以前把它当账号闸门会让整池白跑一遍。
+// "This model is for credit users."，那属于"模型被拒"，换账号也没用。
 const ACCOUNT_GATE_RES = [
   /ads_required/i,
   /hourly_ceiling/i,
@@ -648,7 +637,7 @@ function isAccountGate(text) {
 // 单账号：默认零曝光；被广告闸门拦下才补曝光。版本就地学、session 就地 reset。
 async function sendWithGates(token, body, env, onStreamEnd) {
   await upstreamMinVersion(); // 首次请求先把上游版本取回来，避免每个请求先吃一次 403
-  const sid = stableSessionId(token); // 每账号稳定会话（上游按 会话 记并发槽位）
+  const sid = stableSessionId(token); // 每账号稳定会话（上游按会话记并发槽位）
   const turn = crypto.randomUUID();   // 每请求一轮，与广告流程同轮
   // 懒曝光：只有"最近被闸门拦过"的号才预热，正常账号这里是 0 次广告子请求。
   if (needsAds(token)) {
@@ -656,7 +645,7 @@ async function sendWithGates(token, body, env, onStreamEnd) {
   }
   let res = await chatFetch(token, body, env, null, sid, onStreamEnd, turn);
   let sessionResetDone = false;
-  let adsGateHit = false; // 本轮是否真的被广告闸门拦过（决定能否算"干净成功"）
+  let adsGateHit = false;    // 本轮是否真的被广告闸门拦过（决定能否算"干净成功"）
   let cannedRetried = false; // 罐头只就地补一次曝光，避免无限循环
 
   for (let round = 0; round < MAX_GATE_ROUNDS; round++) {
@@ -692,15 +681,14 @@ async function sendWithGates(token, body, env, onStreamEnd) {
         // 用 cmpVersion 做数字比较：只有 retry 比当前生效版本更高才重试。
         // 之前用 retry !== clientVersion(env) 做字符串不等比较，当 latest > retry
         // 时条件恒真，会在 MAX_GATE_ROUNDS 内空转。
-        const sentVersion = clientVersion(env);
-        if (retry && cmpVersion(retry, sentVersion) > 0) {
+        if (retry && cmpVersion(retry, clientVersion(env)) > 0) {
           LEARNED_MIN_VERSION = retry;
           res = await chatFetch(token, body, env, retry, sid, onStreamEnd, turn);
           continue;
         }
         // 上游报错但没给出版本：强制刷新一次 min 再试
         const fresh = await upstreamMinVersion({ force: true });
-        if (fresh && fresh !== clientVersion(env)) {
+        if (fresh && cmpVersion(fresh, clientVersion(env)) > 0) {
           LEARNED_MIN_VERSION = fresh;
           res = await chatFetch(token, body, env, fresh, sid, onStreamEnd, turn);
           continue;
@@ -709,13 +697,12 @@ async function sendWithGates(token, body, env, onStreamEnd) {
       // 426 = Upgrade Required：上游只给状态码、正文为空，必须主动去读 min
       if (res.status === 426) {
         const fresh = await upstreamMinVersion({ force: true });
-        // 只有 fresh 比当前发送的版本更高才值得重试，否则原样透传。
         if (fresh && cmpVersion(fresh, clientVersion(env)) > 0) {
           LEARNED_MIN_VERSION = fresh;
           res = await chatFetch(token, body, env, fresh, sid, onStreamEnd, turn);
           continue;
         }
-        return errorLike(res, probe); // 上游没给出更高的版本：原样交池层
+        return errorLike(res, probe); // 上游没给出更高版本：原样交池层
       }
       return errorLike(res, probe); // 其他 403：真错误（如付费模型），交池层透传
     }
@@ -738,6 +725,124 @@ async function sendWithGates(token, body, env, onStreamEnd) {
   return res;
 }
 
+// ── 会话-账号绑定（上游 2026-11 新增的服务端校验）─────────────────
+// 上游会按"会话内容指纹"记住这段对话属于哪个账号，同一对话换号续写会回：
+//   "This conversation belongs to another free-pi account.
+//    Sharing or rotating accounts isn't allowed; use one account per person."
+// CLI 0.6.19 里没有这段文案，说明是纯服务端校验，比 CLI 还新。
+// 对策：粘性路由 —— 同一会话永远走同一账号；遇到该错误就换到真正的归属号并记住。
+
+const CONV_MISMATCH_RE = /belongs to another free-pi account|Sharing or rotating accounts/i;
+
+const CONV_BINDING = new Map(); // 会话指纹 -> { token, at }（L1 内存缓存）
+const CONV_BINDING_MAX = 500;
+const CONV_MEM_TTL_MS = 60 * 60 * 1000;  // 内存缓存 1 小时
+const CONV_KV_TTL_S = 7 * 24 * 60 * 60;  // KV 里存 7 天
+const CONV_KV_BINDING = 'CONV_KV';       // Cloudflare KV 绑定名
+
+// KV 是可选的：没绑定就自动退回纯内存，行为与之前完全一致。
+function convKv(env) {
+  const kv = env && env[CONV_KV_BINDING];
+  return kv && typeof kv.get === 'function' ? kv : null;
+}
+
+// FNV-1a 32 位：够用来分桶，不需要密码学强度。
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+// KV 里只存 token 的指纹，不存 token 本身 —— KV 内容在控制台可见，
+// 存原文等于把账号凭据摊在面板上。
+function tokenFingerprint(token) {
+  return String(fnv1a(token));
+}
+
+async function kvGetBinding(env, key) {
+  const kv = convKv(env);
+  if (!kv || !key) return null;
+  try {
+    const v = await kv.get('c:' + key);
+    return typeof v === 'string' && v ? v : null;
+  } catch {
+    return null; // KV 故障不能影响聊天
+  }
+}
+
+function kvPutBinding(env, key, token) {
+  const kv = convKv(env);
+  if (!kv || !key) return;
+  try {
+    const p = kv.put('c:' + key, tokenFingerprint(token), { expirationTtl: CONV_KV_TTL_S });
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch {}
+}
+
+// 会话指纹：只取第一条用户消息，**完全不看 system**。// 客户端常把时间、环境、工作目录注入 system，一注入指纹就变，同一对话会被
+// 拆到两个账号上 —— 这正是"跑着跑着就报错"的根因。
+// 只取 user 消息既稳定，又比服务端更粗：两段被服务端视为不同的对话落到同一
+// 账号不会报错，反过来（我们更细）才会触发绑定错误。
+function conversationKey(body) {
+  try {
+    const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+    for (const m of msgs) {
+      if (!m || typeof m !== 'object' || m.role !== 'user') continue;
+      let c = m.content;
+      if (Array.isArray(c)) {
+        c = c.map((p) => (p && typeof p === 'object' && typeof p.text === 'string' ? p.text : '')).join(' ');
+      }
+      const s = String(c ?? '').replace(/\s+/g, ' ').trim();
+      if (!s) continue;
+      return fnv1a(s.slice(0, 512)).toString(36);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// 实验开关：CONV_NONCE=1 时给每个账号的请求加一个"账号专属系统消息"，
+// 让服务端把同一段对话看成不同对话，从而绕开会话-账号绑定。
+// 只用于判断服务端指纹算法；副作用是模型会看到这条系统消息、且换号要重发全量历史。
+function withConversationNonce(messages, convKey, token) {
+  if (!Array.isArray(messages) || !convKey) return messages;
+  const tag = '[conv:' + fnv1a(convKey + ':' + token).toString(36) + ']';
+  return [{ role: 'system', content: tag }, ...messages];
+}
+
+// 绑定会话：写内存缓存（L1）+ KV（持久化，仅在实际变化时写）。
+function bindConversation(key, token, env) {
+  if (!key) return;
+  const prev = CONV_BINDING.get(key);
+  CONV_BINDING.set(key, { token, at: Date.now() });
+  if (CONV_BINDING.size > CONV_BINDING_MAX) {
+    // 简单的 FIFO 淘汰，避免 isolate 内存无限增长
+    const oldest = CONV_BINDING.keys().next().value;
+    if (oldest !== undefined) CONV_BINDING.delete(oldest);
+  }
+  // 只有真正换了归属才写 KV，避免每个请求都写一次
+  if (!prev || prev.token !== token) kvPutBinding(env, key, token);
+}
+
+// 解析会话归属：先看内存，未命中再读 KV（跨实例/重启后仍能找回原账号）。
+async function resolveConversationBinding(key, env, accounts) {
+  if (!key) return null;
+  const mem = CONV_BINDING.get(key);
+  if (mem && Date.now() - mem.at < CONV_MEM_TTL_MS && accounts.some((a) => a.token === mem.token)) {
+    return mem.token;
+  }
+  const stored = await kvGetBinding(env, key);
+  if (!stored) return null;
+  const hit = accounts.find((a) => tokenFingerprint(a.token) === stored);
+  if (!hit) return null; // 账号池变了，旧绑定作废，交给服务端纠正
+  CONV_BINDING.set(key, { token: hit.token, at: Date.now() });
+  return hit.token;
+}
+
 // ── 走池 ──────────────────────────────────────────────────────────
 
 // 池内可换号的状态
@@ -745,7 +850,8 @@ const SWITCH_STATUS = new Set([401, 403, 409, 429, 402]);
 
 function cooldownFor(status) {
   if (status >= 500) return COOLDOWN_NETWORK_MS; // 上游临时故障，30 秒
-  return COOLDOWN_MS; // 其他（401/429/403/409/402）5 分钟
+  if (status === 429 || status === 402) return COOLDOWN_429_MS; // 限流 1 小时
+  return COOLDOWN_MS; // 其他（401/403/409）5 分钟
 }
 
 // 账号级闸门里区分"额度用完"和"临时故障"
@@ -753,16 +859,14 @@ const QUOTA_HOURLY_RE = /hourly_ceiling/i;
 const QUOTA_DAILY_RE = /quota_exhausted|credits_exhausted|daily_ceiling|insufficient[_ ]credits?|out of credits/i;
 
 // 上游还会把"广告闸门"文案伪装成 HTTP 200 的"补全"塞进 content（usage 全 0），
-// 状态码完全正常，任何 403/429 闸门都拦不到它。实测触发条件是会话没按 CLI
-// 形状加载广告（与剩余额度无关），完整广告流程走通后即消失。
-// 保留内容识别兜底：一旦罐头再现，按账号闸门冷却换号，别让它流到客户端。
+// 状态码完全正常，任何 403/429 闸门都拦不到它。实测触发条件是账号没按 CLI
+// 形状真实曝光广告（与剩余额度无关），走通广告流程后即消失。
 const CANNED_PAUSE_RE = /free-pi is free because it shows ads/i;
 
-async function chatAcrossPool(accounts, body, env, cors, mode = DEFAULT_ROUTING) {
+async function chatAcrossPool(accounts, body, env, cors) {
   if (!accounts.length) {
     return Response.json({ error: { message: 'no token configured', code: 'upstream_error' } }, { status: 502, headers: cors });
   }
-  // 会话 id 由 sendWithGates 按账号各自持有（稳定），不再每请求随机
   let last = null;
   let lastStatus = 0;
   const rejected = [];
@@ -771,38 +875,76 @@ async function chatAcrossPool(accounts, body, env, cors, mode = DEFAULT_ROUTING)
 
   // drain 模式：先读一轮额度（5 分钟缓存），把已经见底的账号排除在外。
   // 如果全池都没额度，强制刷新一次（可能刚过 UTC 零点或刚充值）；
+  // 先读一轮额度（5 分钟缓存），把已经见底的账号排除在外。
+  // 如果全池都没额度，强制刷新一次（可能刚过 UTC 零点或刚充值）；
   // 仍然没有就直接快速失败，不要拿 N 个注定 429 的请求去骚扰上游。
-  if (mode !== 'rotate') {
-    await Promise.all(accounts.map((a) => ensureQuota(a.token, env)));
-    const usableNow = accounts.filter((a) => !exhausted(a.token) && !cooling(a.token));
-    if (!usableNow.length) {
-      await Promise.all(accounts.map((a) => ensureQuota(a.token, env, true)));
-      const after = accounts.filter((a) => !exhausted(a.token) && !cooling(a.token));
-      if (!after.length) {
-        const timestamps = accounts.map((a) => EXHAUSTED_UNTIL.get(a.token) || Date.now());
-        return Response.json({
-          error: {
-            message: '所有 freepi 账号的今日额度都已用完，等下一个 UTC 零点重置，或换一个账号池。',
-            code: 'all_exhausted',
-            resets_at: new Date(Math.min(...timestamps)).toISOString(),
-            accounts: accounts.map((a) => a.name),
-          },
-        }, { status: 429, headers: cors });
-      }
+  await Promise.all(accounts.map((a) => ensureQuota(a.token, env)));
+  const usableList = accounts.filter((a) => !exhausted(a.token) && !cooling(a.token));
+  if (!usableList.length) {
+    await Promise.all(accounts.map((a) => ensureQuota(a.token, env, true)));
+    const after = accounts.filter((a) => !exhausted(a.token) && !cooling(a.token));
+    if (!after.length) {
+      const timestamps = accounts.map((a) => EXHAUSTED_UNTIL.get(a.token) || Date.now());
+      return Response.json({
+        error: {
+          message: '所有 freepi 账号的今日额度都已用完，等下一个 UTC 零点重置，或换一个账号池。',
+          code: 'all_exhausted',
+          resets_at: new Date(Math.min(...timestamps)).toISOString(),
+          accounts: accounts.map((a) => a.name),
+        },
+      }, { status: 429, headers: cors });
     }
   }
 
-  for (const acct of orderedPool(accounts, mode)) {
+  // 会话粘性：同一段对话必须永远走同一个账号，否则上游会回"belongs to another account"。
+  // CONV_NONCE=1 时改用加盐实验：不绑定、每轮按额度优先选号，靠系统消息区分"对话"。
+  const useNonce = !!(env && env.CONV_NONCE === '1');
+  const convKey = conversationKey(body);
+  const pool = orderedPool(accounts);
+  const boundToken = useNonce ? null : await resolveConversationBinding(convKey, env, accounts);
+  let ordered = pool;
+  if (convKey && boundToken && pool.some((a) => a.token === boundToken)) {
+    // 已绑定：只用这个号。服务端规则就是"一段对话一个账号"，
+    // 换号必定报错，所以宁可在它不可用时诚实报错，也不去撞别的号。
+    ordered = pool.filter((a) => a.token === boundToken);
+  } else if (convKey) {
+    // 新对话的选号策略：
+    //  1. 优先剩余额度最多的账号（读 /me 的 5 分钟缓存）—— 谁多先用谁，
+    //     被用的号余额下降后自然轮到下一个，几个号会被均匀用满；
+    //  2. 额度相同时用会话指纹定顺序：既不扎堆 1 号，也在 isolate 重启后保持稳定。
+    const h = fnv1a(convKey);
+    const n = accounts.length;
+    const hashRank = (a) => {
+      const i = accounts.findIndex((x) => x.token === a.token);
+      return i < 0 ? n : (i - (h % n) + n) % n;
+    };
+    const usableNow = (a) => !exhausted(a.token) && !cooling(a.token);
+    const ready = pool.filter(usableNow).sort((a, b) => {
+      const qa = quotaRemaining(a.token);
+      const qb = quotaRemaining(b.token);
+      return qa !== qb ? qb - qa : hashRank(a) - hashRank(b);
+    });
+    const rest = pool.filter((a) => !usableNow(a));
+    ordered = [...ready, ...rest];
+  }
+  let convMismatch = 0;
+
+  for (const acct of ordered) {
     const token = acct.token;
     inflight(token, +1);
     let released = false;
     const release = () => { if (!released) { released = true; inflight(token, -1); } };
     let res = null;
 
+    // 加盐模式：把消息换成"带账号专属系统消息"的副本，让服务端视为不同对话。
+    const attemptBody = useNonce && convKey
+      ? { ...body, messages: withConversationNonce(body.messages, convKey, token) }
+      : body;
+
     try {
-      res = await sendWithGates(token, body, env, body.stream ? release : null);
+      res = await sendWithGates(token, attemptBody, env, body.stream ? release : null);
     } catch (err) {
-      LAST_ERROR.set(token, String(err && err.message || err).slice(0, 200));
+      LAST_ERROR.set(token, String((err && err.message) || err).slice(0, 200));
       cool(token, COOLDOWN_NETWORK_MS, 'network');
       continue;
     } finally {
@@ -810,44 +952,74 @@ async function chatAcrossPool(accounts, body, env, cors, mode = DEFAULT_ROUTING)
     }
 
     const status = res.status;
-    if (!SWITCH_STATUS.has(status) && status < 500) {
-      // 流式不读响应体，罐头检测做不了，原样透传
-      if (body.stream) {
-        COOLDOWN_UNTIL.delete(token);
-        LAST_ERROR.delete(token);
-        return res;
-      }
-      const okText = await res.text().catch(() => '');
-      if (CANNED_PAUSE_RE.test(okText)) {
-        // 罐头：sendWithGates 已经就地补过一次曝光还是罐头，说明曝光也救不回来。
-        // 短冷却换号，别让它流到客户端。
-        cannedCount++;
-        LAST_ERROR.set(token, `${status} canned pause reply`);
-        cool(token, COOLDOWN_MS, 'canned pause (after retry)'); // 5 分钟
-        lastStatus = 429;
-        last = Response.json({
-          error: {
-            message: `账号 ${acct.name} 补曝光后仍被罐头拦截，已换号重试。`,
-            code: 'canned_pause',
-          },
-        }, { status: 429, headers: cors });
-        continue;
-      }
+
+    // 流式成功：不读正文，直接透传
+    if (body.stream && res.ok) {
       COOLDOWN_UNTIL.delete(token);
       LAST_ERROR.delete(token);
-      return errorLike(res, okText); // 体已读，重建响应返回（成功或客户端错误）
+      if (!useNonce) bindConversation(convKey, token, env);
+      return res;
     }
 
+    // 其余情况一律读正文做内容判定：错误体都是小 JSON，流式错误也能安全读。
+    // 以前流式 4xx 直接透传，导致英文原文漏给客户端。
     const text = await res.text().catch(() => '');
+
+    // 会话归属错误：按内容判定，**不看状态码**（上游可能是 403 / 409 / 400）
+    if (CONV_MISMATCH_RE.test(text)) {
+      convMismatch++;
+      LAST_ERROR.set(token, 'conversation belongs to another account');
+      lastStatus = 409;
+      last = Response.json({
+        error: {
+          message: '这段对话属于池子里另一个 free-pi 账号，正在切换归属账号重试。',
+          code: 'conversation_account_mismatch',
+        },
+      }, { status: 409, headers: cors });
+      continue;
+    }
+
+    // 罐头：伪装成 200 的闸门文案
+    if (CANNED_PAUSE_RE.test(text)) {
+      // sendWithGates 已经就地补过一次曝光还是罐头，说明曝光也救不回来。
+      cannedCount++;
+      LAST_ERROR.set(token, `${status} canned pause reply`);
+      cool(token, COOLDOWN_MS, 'canned pause (after retry)');
+      lastStatus = 429;
+      last = Response.json({
+        error: {
+          message: `账号 ${acct.name} 补曝光后仍被罐头拦截，已换号重试。`,
+          code: 'canned_pause',
+        },
+      }, { status: 429, headers: cors });
+      continue;
+    }
+
+    // 真成功（含 2xx）：绑定会话
+    if (status < 400) {
+      COOLDOWN_UNTIL.delete(token);
+      LAST_ERROR.delete(token);
+      if (!useNonce) bindConversation(convKey, token, env);
+      return errorLike(res, text);
+    }
+
+    // 不换号的客户端错误（400/404/413 等）：原样返回
+    if (!SWITCH_STATUS.has(status) && status < 500) {
+      COOLDOWN_UNTIL.delete(token);
+      LAST_ERROR.delete(token);
+      return errorLike(res, text);
+    }
+
+    // 真 403（例如付费模型）：换号无用，原样透传
     if (status === 403 && !isAccountGate(text)) {
-      return errorLike(res, text); // 真 403（例如付费模型），原样透传
+      return errorLike(res, text);
     }
 
     LAST_ERROR.set(token, `${status} ${text.slice(0, 160)}`);
     if (QUOTA_DAILY_RE.test(text)) {
       markExhausted(token, `${status} ${text.slice(0, 80)}`); // 用光：等到下一个 UTC 零点
     } else if (QUOTA_HOURLY_RE.test(text)) {
-      cool(token, COOLDOWN_MS, `${status} hourly_ceiling`);
+      cool(token, COOLDOWN_429_MS, `${status} hourly_ceiling`); // 1 小时，与上游限流窗口对齐
     } else {
       cool(token, cooldownFor(status), `${status}`);
     }
@@ -881,6 +1053,30 @@ async function chatAcrossPool(accounts, body, env, cors, mode = DEFAULT_ROUTING)
         accounts: accounts.map((a) => a.name),
       },
     }, { status: 429, headers: cors });
+  }
+
+  // 会话归属问题：给可读诊断，绝不把上游那句英文原文甩给客户端
+  if (convMismatch) {
+    // 已绑定的会话：绑定的号这次不可用（额度/冷却/广告闸门），而换号必被拒
+    if (boundToken) {
+      const bound = accounts.find((a) => a.token === boundToken);
+      return Response.json({
+        error: {
+          message: `这段对话绑定在账号「${bound ? bound.name : '未知'}」上，该账号当前不可用（额度或冷却），换号会被上游拒绝。稍后重试，或开一个新对话。`,
+          code: 'conversation_account_unavailable',
+          account: bound ? bound.name : null,
+          last_error: LAST_ERROR.get(boundToken) || null,
+        },
+      }, { status: 409, headers: cors });
+    }
+    // 未绑定且整池都不认：对话是在池子外的账号上开的
+    return Response.json({
+      error: {
+        message: '这段对话属于池子之外的另一个 free-pi 账号。开新对话（新聊天）即可，或把开这段对话时用的账号加进 FREEPI_TOKENS。',
+        code: 'conversation_account_mismatch',
+        accounts: accounts.map((a) => a.name),
+      },
+    }, { status: 409, headers: cors });
   }
 
   return last ?? Response.json({ error: { message: 'all accounts failed', code: 'upstream_error' } }, { status: 502, headers: cors });
